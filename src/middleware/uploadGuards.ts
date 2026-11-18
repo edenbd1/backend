@@ -16,10 +16,45 @@ export function __getActiveUploadCount(): number {
   return activeUploads;
 }
 
+/**
+ * Bounds for the non-file parts of a multipart body (#231). The publish
+ * schemas accept at most five text fields (title, description, price,
+ * walletAddress, externalUrl) plus one file, so these leave a little headroom
+ * while stopping bodies with thousands of fields or oversized metadata values
+ * from being parsed into memory.
+ */
+export const MULTIPART_LIMITS = {
+  /** Max number of non-file fields. */
+  fields: 10,
+  /** Max number of parts (fields + files). */
+  parts: 11,
+  /** Max size of a single non-file field value, in bytes. */
+  fieldSize: 64 * 1024,
+  /** Max length of a field name. */
+  fieldNameSize: 100,
+} as const;
+
 const upload = multer({
   storage: multer.diskStorage({ destination: os.tmpdir() }),
-  limits: { fileSize: config.MAX_FILE_SIZE_MB * 1024 * 1024 },
+  limits: {
+    fileSize: config.MAX_FILE_SIZE_MB * 1024 * 1024,
+    ...MULTIPART_LIMITS,
+    // busboy flags a value as truncated once it *reaches* fieldSize, so allow
+    // one extra byte to make MULTIPART_LIMITS.fieldSize an inclusive maximum.
+    fieldSize: MULTIPART_LIMITS.fieldSize + 1,
+  },
 });
+
+/** Client-facing messages for multer limits that map to 413 Payload Too Large. */
+const PAYLOAD_LIMIT_MESSAGES: Partial<Record<MulterError["code"], (err: MulterError) => string>> = {
+  LIMIT_FILE_SIZE: () => `File exceeds the maximum size of ${config.MAX_FILE_SIZE_MB}MB`,
+  LIMIT_FIELD_COUNT: () => `Too many form fields (maximum ${MULTIPART_LIMITS.fields})`,
+  LIMIT_PART_COUNT: () => `Too many multipart parts (maximum ${MULTIPART_LIMITS.parts})`,
+  LIMIT_FIELD_VALUE: (err) =>
+    `Form field ${err.field ? `"${err.field}" ` : ""}exceeds the maximum size of ${MULTIPART_LIMITS.fieldSize} bytes`,
+  LIMIT_FIELD_KEY: () =>
+    `Form field name exceeds the maximum length of ${MULTIPART_LIMITS.fieldNameSize} characters`,
+};
 
 /**
  * Wraps `multer().single(field)` and maps multer errors to clear HTTP statuses
@@ -29,6 +64,11 @@ const upload = multer({
  * Uploads are streamed to a temp file on disk rather than buffered in memory,
  * and at most `MAX_CONCURRENT_UPLOADS` are processed at once; excess requests
  * are rejected with 503 (#90).
+ *
+ * Bodies exceeding `MULTIPART_LIMITS` (too many fields or parts, or an
+ * oversized field name/value) are rejected with 413 (#231). Multer removes any
+ * temp file it already wrote before reporting the error, and the concurrency
+ * slot is released immediately.
  */
 export function singleFileUpload(field = "file"): RequestHandler {
   const handler = upload.single(field);
@@ -51,13 +91,9 @@ export function singleFileUpload(field = "file"): RequestHandler {
     handler(req, res, (err: unknown) => {
       if (err instanceof MulterError) {
         release();
-        if (err.code === "LIMIT_FILE_SIZE") {
-          next(
-            new AppError(
-              "PAYLOAD_TOO_LARGE",
-              `File exceeds the maximum size of ${config.MAX_FILE_SIZE_MB}MB`,
-            ),
-          );
+        const payloadLimitMessage = PAYLOAD_LIMIT_MESSAGES[err.code];
+        if (payloadLimitMessage) {
+          next(new AppError("PAYLOAD_TOO_LARGE", payloadLimitMessage(err)));
           return;
         }
         next(new AppError("VALIDATION_ERROR", `Upload error: ${err.message}`));

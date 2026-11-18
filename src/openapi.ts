@@ -1217,7 +1217,11 @@ export const openApiSpec = {
             content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
           },
           "413": {
-            description: "Uploaded file exceeds the maximum allowed size",
+            // Keep the multipart limits in sync with MULTIPART_LIMITS (src/middleware/uploadGuards.ts).
+            description:
+              "Uploaded file exceeds the maximum allowed size, or the multipart body exceeds its " +
+              "limits: more than 10 form fields or 11 parts, a field value over 64 KiB, or a " +
+              "field name over 100 characters",
             content: { "application/json": { schema: { $ref: "#/components/schemas/Error" } } },
           },
           "415": {
